@@ -9,25 +9,43 @@ from PyQt5.QtGui import QPixmap, QImage, QFont
 from PyQt5.QtCore import Qt
 from PIL import Image
 import numpy as np
-from src.model import UNet
-from src.dataset import ImagePairDataset
-from src.utils import rgb_to_lab_tensor, lab_to_rgb_np
+from skimage import color
 from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from src.utils import *
+from src.convolution import convolute
 
+l_cent, l_norm, ab_norm = 50, 100, 110
+
+# Convolution Helpers
+def normalize_l(in_l): return (in_l - l_cent) / l_norm
+def unnormalize_ab(in_ab): return in_ab * ab_norm
+
+def preprocess_convolution(img_rgb, HW=(256,256)):
+    from PIL import Image
+    img_rs = np.array(Image.fromarray(img_rgb).resize((HW[1], HW[0])))
+    lab_orig = color.rgb2lab(img_rgb)
+    lab_rs = color.rgb2lab(img_rs)
+    tens_l_orig = torch.Tensor(lab_orig[:,:,0])[None,None,...]
+    tens_l_rs = torch.Tensor(lab_rs[:,:,0])[None,None,...]
+    return tens_l_orig, tens_l_rs
+
+def postprocess_convolution(tens_orig_l, out_ab):
+    HW_orig = tens_orig_l.shape[2:]
+    HW = out_ab.shape[2:]
+    if HW != HW_orig:
+        out_ab = F.interpolate(out_ab, size=HW_orig, mode='bilinear')
+    out_lab = torch.cat((tens_orig_l, out_ab), dim=1)
+    return color.lab2rgb(out_lab[0].cpu().numpy().transpose(1,2,0))
+
+# GUI
 class ColorizationGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pseudo-Colorization GUI")
-        self.setGeometry(100, 50, 1300, 700)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.showMaximized()
 
-        # Load model
-        self.model = UNet().to(self.device)
-        model_path = os.path.join("models", "ckpt_epoch6.pth")
-        if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        self.model.eval()
+        self.colorizer_convolution = convolute().eval()
 
         self.input_imgs = []
         self.gt_imgs = []
@@ -53,11 +71,6 @@ class ColorizationGUI(QWidget):
         self.btn_load = QPushButton("Load Images")
         self.btn_load.clicked.connect(self.load_images)
         btn_layout.addWidget(self.btn_load)
-
-        self.btn_load_default = QPushButton("Load Default Test Dataset (50 images)")
-        self.btn_load_default.clicked.connect(self.load_default_dataset)
-        btn_layout.addWidget(self.btn_load_default)
-
         layout.addLayout(btn_layout)
 
         # Scrollable area
@@ -98,21 +111,6 @@ class ColorizationGUI(QWidget):
                 self.gt_imgs.append(None)
         self.colorize_and_display()
 
-    def load_default_dataset(self):
-        data_dir = "data"
-        dataset = ImagePairDataset(data_dir, split="test", img_size=(224,224))
-        loader = DataLoader(dataset, batch_size=1, shuffle=False)
-        self.input_imgs, self.gt_imgs = [], []
-        for i, (L, ab, _) in enumerate(loader):
-            if i >= 50:  # Limit to first 50
-                break
-            L_np = L[0,0].numpy()*100
-            ab_np = ab[0].numpy()
-            gt_rgb = lab_to_rgb_np(L_np, ab_np[0]*127, ab_np[1]*127)
-            self.input_imgs.append(L_np)
-            self.gt_imgs.append(gt_rgb)
-        self.colorize_and_display()
-
     def colorize_and_display(self):
         # Clear scroll area
         for i in reversed(range(self.scroll_layout.count())):
@@ -125,18 +123,20 @@ class ColorizationGUI(QWidget):
         psnr_list, ssim_list = [], []
 
         for i, input_img in enumerate(self.input_imgs):
-            # Prepare input tensor
+            # Convert input_img to RGB numpy if it's grayscale PIL
             if isinstance(input_img, Image.Image):
-                L_tensor = rgb_to_lab_tensor(input_img).unsqueeze(0).to(self.device)
-                L_np = np.array(input_img).astype(np.float32)/255*100
+                img_rgb = np.array(input_img.convert("RGB"))
+                L_np = np.array(input_img).astype(np.float32)
             else:
+                img_rgb = input_img
                 L_np = input_img
-                L_tensor = torch.from_numpy(L_np/100)[None,None,...].float().to(self.device)
 
-            # Predict
+            # Convolution preprocessing
+            tens_orig_l, tens_rs_l = preprocess_convolution(img_rgb)
             with torch.no_grad():
-                ab_pred = self.model(L_tensor).cpu().numpy()[0]
-            pred_rgb = lab_to_rgb_np(L_np, ab_pred[0]*127, ab_pred[1]*127)
+                out_ab = self.colorizer_convolution(tens_rs_l)
+            pred_rgb = postprocess_convolution(tens_orig_l, out_ab.cpu())
+            pred_rgb = (pred_rgb*255).clip(0,255).astype(np.uint8)
 
             # Ground truth
             gt_img = self.gt_imgs[i]
@@ -171,18 +171,23 @@ class ColorizationGUI(QWidget):
         row_layout = QHBoxLayout()
         row_layout.setSpacing(10)
 
+        preview_size = 256
+
         # Input
-        img_input = (L_np/100*255).astype(np.uint8) if not isinstance(L_np, Image.Image) else np.array(L_np)
+        if isinstance(L_np, Image.Image):
+            img_input = np.array(L_np)
+        else:
+            img_input = (L_np/np.max(L_np)*255).astype(np.uint8)  # normalize to 0-255
         qimg_input = QImage(img_input.tobytes(), img_input.shape[1], img_input.shape[0], QImage.Format_Grayscale8)
         lbl_input = QLabel()
-        lbl_input.setPixmap(QPixmap.fromImage(qimg_input).scaled(128,128,Qt.KeepAspectRatio))
+        lbl_input.setPixmap(QPixmap.fromImage(qimg_input).scaled(preview_size, preview_size, Qt.KeepAspectRatio))
         row_layout.addWidget(lbl_input)
 
         # Ground truth
         if gt_rgb is not None:
             qimg_gt = QImage(gt_rgb.tobytes(), gt_rgb.shape[1], gt_rgb.shape[0], QImage.Format_RGB888)
             lbl_gt = QLabel()
-            lbl_gt.setPixmap(QPixmap.fromImage(qimg_gt).scaled(128,128,Qt.KeepAspectRatio))
+            lbl_gt.setPixmap(QPixmap.fromImage(qimg_gt).scaled(preview_size, preview_size, Qt.KeepAspectRatio))
         else:
             lbl_gt = QLabel("N/A")
             lbl_gt.setAlignment(Qt.AlignCenter)
@@ -191,7 +196,7 @@ class ColorizationGUI(QWidget):
         # Predicted
         qimg_pred = QImage(pred_rgb.tobytes(), pred_rgb.shape[1], pred_rgb.shape[0], QImage.Format_RGB888)
         lbl_pred = QLabel()
-        lbl_pred.setPixmap(QPixmap.fromImage(qimg_pred).scaled(128,128,Qt.KeepAspectRatio))
+        lbl_pred.setPixmap(QPixmap.fromImage(qimg_pred).scaled(preview_size, preview_size, Qt.KeepAspectRatio))
         row_layout.addWidget(lbl_pred)
 
         # Metrics
