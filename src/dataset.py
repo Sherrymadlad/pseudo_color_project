@@ -2,15 +2,14 @@ import os
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from src.utils import rgb_to_lab_tensor
+from src.utils import rgb_to_lab_tensor, rgb_to_lab_tensor_full
 import torchvision.transforms as T
 
 class ImagePairDataset(Dataset):
-    def __init__(self, root_dir, split="train", img_size=(224, 224), hist_bins=32):
+    def __init__(self, root_dir, split="train", img_size=(224, 224)):
         self.root_dir = root_dir
         self.split = split
         self.img_size = img_size
-        self.hist_bins = hist_bins
 
         self.black_dir = os.path.join(root_dir, f"{split}_black")
         self.color_dir = os.path.join(root_dir, f"{split}_color")
@@ -35,16 +34,4 @@ class ImagePairDataset(Dataset):
         L = rgb_to_lab_tensor(black_img)      # 1xHxW
         lab = self.rgb_to_lab_tensor_full(color_img)  # 2xHxW
 
-        hist = torch.zeros(self.hist_bins)  # placeholder
-
-        return L.float(), lab.float(), hist.float()
-
-    @staticmethod
-    def rgb_to_lab_tensor_full(img):
-        import numpy as np
-        from skimage import color
-        arr = np.array(img).astype(np.float32)/255.0
-        lab = color.rgb2lab(arr)
-        L = lab[:,:,0][None,...]/100.0
-        ab = lab[:,:,1:3].transpose(2,0,1)/127.0
-        return torch.from_numpy(ab)
+        return L.float(), lab.float()

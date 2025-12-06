@@ -26,3 +26,12 @@ def rgb_to_lab_tensor(img):
         img = img.convert("L")
     arr = np.array(img).astype(np.float32)/255.0
     return torch.from_numpy(arr[None,...])
+
+def rgb_to_lab_tensor_full(img):
+    import numpy as np
+    from skimage import color
+    arr = np.array(img).astype(np.float32)/255.0
+    lab = color.rgb2lab(arr)
+    L = lab[:,:,0][None,...]/100.0
+    ab = lab[:,:,1:3].transpose(2,0,1)/127.0
+    return torch.from_numpy(ab)
